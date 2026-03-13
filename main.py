@@ -1,13 +1,12 @@
 # Note: The one change we need to make if we're in Colab is to uncomment this below block.
-# If we are in an ipython session or a notebook, clear the state to avoid bugs
-"""
+# If we are in an ipython session or a notebook, clear the state to avoid bug
 try:
   _ = get_ipython().__class__.__name__
   ## we set -f below to avoid prompting the user before clearing the notebook state
   %reset -f
 except NameError:
   pass ## we're still good
-"""
+
 import functools
 from functools import partial
 import os
