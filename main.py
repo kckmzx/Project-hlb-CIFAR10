@@ -3,7 +3,7 @@
 try:
   _ = get_ipython().__class__.__name__
   ## we set -f below to avoid prompting the user before clearing the notebook state
-  %reset -f
+  reset -f
 except NameError:
   pass ## we're still good
 
