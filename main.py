@@ -7,6 +7,7 @@ try:
 except NameError:
   pass ## we're still good
 
+import argparse
 import functools
 from functools import partial
 import os
@@ -37,20 +38,83 @@ from torchvision import transforms
 # so we can help reduce a possibility that future releases don't take away the accessibility of this codebase.
 #torch.cuda.set_per_process_memory_fraction(fraction=8./40., device=0) ## 40. GB is the maximum memory of the base A100 GPU
 
+#############################################
+#             Argument Parser               #
+#############################################
+
+def get_args():
+    parser = argparse.ArgumentParser(
+        description='hlb-CIFAR10 — ablation-friendly training script',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # --- Training ---
+    train = parser.add_argument_group('Training')
+    train.add_argument('--epochs',       type=int,   default=10,    help='Number of training epochs')
+    train.add_argument('--batchsize',    type=int,   default=512,   help='Training batch size')
+    train.add_argument('--runs',         type=int,   default=25,    help='Number of independent runs (for mean/variance reporting)')
+    train.add_argument('--base-depth',   type=int,   default=64,    help='Base channel depth (use 128 for the ~95.77%% run)')
+    train.add_argument('--device',       type=str,   default='cuda', help='Device to use (cuda or cpu)')
+    train.add_argument('--data-path',    type=str,   default='data.pt', help='Path to the cached dataset file')
+
+    # --- Optimizer ---
+    opt = parser.add_argument_group('Optimizer')
+    opt.add_argument('--bias-lr-scale',     type=float, default=1.0,  help='Multiplicative scale on the bias learning rate')
+    opt.add_argument('--non-bias-lr-scale', type=float, default=1.0,  help='Multiplicative scale on the non-bias learning rate')
+    opt.add_argument('--percent-start',     type=float, default=0.2,  help='OneCycleLR: fraction of steps spent warming up')
+    opt.add_argument('--label-smoothing',   type=float, default=0.2,  help='Label smoothing coefficient for CrossEntropyLoss')
+
+    # --- Data augmentation ---
+    aug = parser.add_argument_group('Data augmentation (ablation)')
+    aug.add_argument('--cutout-size',   type=int,            default=0,
+                     help='Cutout mask size (0 = disabled)')
+    aug.add_argument('--pad-amount',    type=int,            default=3,
+                     help='Reflection padding before random crop (0 = disabled)')
+    aug.add_argument('--no-flip',       action='store_true', default=False,
+                     help='Disable random horizontal flip augmentation')
+    aug.add_argument('--no-crop',       action='store_true', default=False,
+                     help='Disable random crop augmentation')
+
+    # --- Architecture ---
+    arch = parser.add_argument_group('Architecture (ablation)')
+    arch.add_argument('--no-se',        action='store_true', default=False,
+                     help='Disable Squeeze-and-Excite (SE) layers')
+    arch.add_argument('--no-whitening', action='store_true', default=False,
+                     help='Disable the learnable whitening convolution at the input')
+    arch.add_argument('--no-channels-last', action='store_true', default=False,
+                     help='Disable channels_last memory format (disables tensor-core optimisation)')
+
+    # --- EMA ---
+    ema = parser.add_argument_group('Exponential Moving Average (ablation)')
+    ema.add_argument('--no-ema',        action='store_true', default=False,
+                     help='Disable EMA model entirely')
+    ema.add_argument('--ema-epochs',    type=int,   default=2,     help='Number of final epochs using EMA')
+    ema.add_argument('--ema-decay',     type=float, default=0.986, help='EMA decay base')
+    ema.add_argument('--ema-steps',     type=int,   default=2,     help='Update EMA every N steps')
+
+    # --- Eval ---
+    ev = parser.add_argument_group('Evaluation')
+    ev.add_argument('--no-tta',         action='store_true', default=False,
+                     help='Disable test-time augmentation (lr-flip averaging at eval)')
+
+    return parser.parse_args()
+
+args = get_args()
+
 # set global defaults (in this particular file) for convolutions
 default_conv_kwargs = {'kernel_size': 3, 'padding': 'same', 'bias': False}
 
-batchsize = 512
+batchsize  = args.batchsize
 bias_scaler = 32
 # To replicate the ~95.77% accuracy in 188 seconds runs, simply change the base_depth from 64->128 and the num_epochs from 10->80
 hyp = {
     'opt': {
-        'bias_lr':        1.15 * 1.35 * 1. * bias_scaler/batchsize, # TODO: How we're expressing this information feels somewhat clunky, is there maybe a better way to do this? :'))))
-        'non_bias_lr':    1.15 * 1.35 * 1. / batchsize,
+        'bias_lr':        args.bias_lr_scale     * 1.15 * 1.35 * 1. * bias_scaler/batchsize,
+        'non_bias_lr':    args.non_bias_lr_scale * 1.15 * 1.35 * 1. / batchsize,
         'bias_decay':     .85 * 4.8e-4 * batchsize/bias_scaler,
         'non_bias_decay': .85 * 4.8e-4 * batchsize,
         'scaling_factor': 1./10,
-        'percent_start': .2,
+        'percent_start':  args.percent_start,
     },
     'net': {
         'whitening': {
@@ -58,19 +122,30 @@ hyp = {
             'num_examples': 50000,
         },
         'batch_norm_momentum': .8,
-        'cutout_size': 0,
-        'pad_amount': 3,
-        'base_depth': 64 ## This should be a factor of 8 in some way to stay tensor core friendly
+        'cutout_size': args.cutout_size,
+        'pad_amount':  args.pad_amount,
+        'base_depth':  args.base_depth, ## This should be a factor of 8 in some way to stay tensor core friendly
     },
     'misc': {
         'ema': {
-            'epochs': 2,
-            'decay_base': .986,
-            'every_n_steps': 2,
+            'epochs':       args.ema_epochs,
+            'decay_base':   args.ema_decay,
+            'every_n_steps': args.ema_steps,
         },
-        'train_epochs': 10,
-        'device': 'cuda',
-        'data_location': 'data.pt',
+        'train_epochs':  args.epochs,
+        'device':        args.device,
+        'data_location': args.data_path,
+    },
+    # Ablation flags — read by the network / training loop below
+    'ablation': {
+        'use_se':            not args.no_se,
+        'use_whitening':     not args.no_whitening,
+        'use_channels_last': not args.no_channels_last,
+        'use_flip':          not args.no_flip,
+        'use_crop':          not args.no_crop,
+        'use_ema':           not args.no_ema,
+        'use_tta':           not args.no_tta,
+        'label_smoothing':   args.label_smoothing,
     }
 }
 
@@ -182,8 +257,10 @@ class ConvGroup(nn.Module):
             self.norm2 = BatchNorm(channels_out)
             self.norm3 = BatchNorm(channels_out)
 
-            self.se1 = nn.Linear(channels_out, channels_out//16)
-            self.se2 = nn.Linear(channels_out//16, channels_out)
+            # SE layers are only built when the ablation flag is set
+            if self.se:
+                self.se1 = nn.Linear(channels_out, channels_out//16)
+                self.se2 = nn.Linear(channels_out//16, channels_out)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -301,7 +378,7 @@ class SpeedyResNet(nn.Module):
 
     # This allows you to customize/change the execution order of the network as needed.
     def forward(self, x):
-        if not self.training:
+        if not self.training and hyp['ablation']['use_tta']:
             x = torch.cat((x, torch.flip(x, (-1,))))
         x = self.net_dict['initial_block']['whiten'](x)
         x = self.net_dict['initial_block']['project'](x)
@@ -313,7 +390,7 @@ class SpeedyResNet(nn.Module):
         x = self.net_dict['pooling'](x)
         x = self.net_dict['linear'](x)
         x = self.net_dict['temperature'](x)
-        if not self.training:
+        if not self.training and hyp['ablation']['use_tta']:
             # Average the predictions from the lr-flipped inputs during eval
             orig, flipped = x.split(x.shape[0]//2, dim=0)
             x = .5 * orig + .5 * flipped
@@ -330,9 +407,9 @@ def make_net():
             'norm': BatchNorm(depths['init'], weight=False),
             'activation': nn.GELU(),
         }),
-        'residual1': ConvGroup(depths['init'], depths['block1'], residual=True, short=False, pool=True, se=True),
-        'residual2': ConvGroup(depths['block1'], depths['block2'], residual=True, short=True, pool=True, se=True),
-        'residual3': ConvGroup(depths['block2'], depths['block3'], residual=True, short=False, pool=True, se=True),
+        'residual1': ConvGroup(depths['init'], depths['block1'], residual=True, short=False, pool=True, se=hyp['ablation']['use_se']),
+        'residual2': ConvGroup(depths['block1'], depths['block2'], residual=True, short=True, pool=True, se=hyp['ablation']['use_se']),
+        'residual3': ConvGroup(depths['block2'], depths['block3'], residual=True, short=False, pool=True, se=hyp['ablation']['use_se']),
         'pooling': FastGlobalMaxPooling(),
         'linear': nn.Linear(depths['block3'], depths['num_classes'], bias=False),
         'temperature': TemperatureScaler(hyp['opt']['scaling_factor'])
@@ -340,14 +417,16 @@ def make_net():
 
     net = SpeedyResNet(network_dict)
     net = net.to(hyp['misc']['device'])
-    net = net.to(memory_format=torch.channels_last) # to appropriately use tensor cores/avoid thrash while training
+    if hyp['ablation']['use_channels_last']:
+        net = net.to(memory_format=torch.channels_last) # to appropriately use tensor cores/avoid thrash while training
     net.train()
     net.half() # Convert network to half before initializing the initial whitening layer.
 
     ## Initialize the whitening convolution
     with torch.no_grad():
         # Initialize the first layer to be fixed weights that whiten the expected input values of the network be on the unit hypersphere. (i.e. their...average vector length is 1.?, IIRC)
-        init_whitening_conv(net.net_dict['initial_block']['whiten'],
+        if hyp['ablation']['use_whitening']:
+            init_whitening_conv(net.net_dict['initial_block']['whiten'],
                             data['train']['images'].index_select(0, torch.randperm(data['train']['images'].shape[0], device=data['train']['images'].device)),
                             num_examples=hyp['net']['whitening']['num_examples'],
                             pad_amount=hyp['net']['pad_amount'],
@@ -438,14 +517,19 @@ def get_batches(data_dict, key, batchsize):
     ## that iterates in chunks over with a random derangement (i.e. shuffled indices) of the individual examples. So we get perfectly-shuffled
     ## batches (which skip the last batch if it's not a full batch), but everything seems to be (and hopefully is! :D) properly shuffled. :)
     if key == 'train':
-        images = batch_crop(data_dict[key]['images'], crop_size) # TODO: hardcoded image size for now?
-        images = batch_flip_lr(images)
+        if hyp['ablation']['use_crop']:
+            images = batch_crop(data_dict[key]['images'], crop_size) # TODO: hardcoded image size for now?
+        else:
+            images = data_dict[key]['images']
+        if hyp['ablation']['use_flip']:
+            images = batch_flip_lr(images)
         images = batch_cutout(images, patch_size=hyp['net']['cutout_size'])
     else:
         images = data_dict[key]['images']
 
     # Send the images to an (in beta) channels_last to help improve tensor core occupancy (and reduce NCHW <-> NHWC thrash) during training
-    images = images.to(memory_format=torch.channels_last)
+    if hyp['ablation']['use_channels_last']:
+        images = images.to(memory_format=torch.channels_last)
     for idx in range(num_epoch_examples // batchsize):
         if not (idx+1)*batchsize > num_epoch_examples: ## Use the shuffled randperm to assemble individual items into a minibatch
             yield images.index_select(0, shuffled[idx*batchsize:(idx+1)*batchsize]), \
@@ -466,7 +550,7 @@ def init_split_parameter_dictionaries(network):
 
 
 ## Hey look, it's the soft-targets/label-smoothed loss! Native to PyTorch. Now, _that_ is pretty cool, and simplifies things a lot, to boot! :D :)
-loss_fn = nn.CrossEntropyLoss(label_smoothing=0.2, reduction='none')
+loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['ablation']['label_smoothing'], reduction='none')
 
 logging_columns_list = ['epoch', 'train_loss', 'val_loss', 'train_acc', 'val_acc', 'ema_val_acc', 'total_time_seconds']
 # define the printing function and print the column heads
@@ -586,7 +670,7 @@ def main():
               opt_bias.zero_grad(set_to_none=True)
               current_steps += 1
 
-              if epoch >= ema_epoch_start and current_steps % hyp['misc']['ema']['every_n_steps'] == 0:          
+              if hyp['ablation']['use_ema'] and epoch >= ema_epoch_start and current_steps % hyp['misc']['ema']['every_n_steps'] == 0:          
                   ## Initialize the ema from the network at this point in time if it does not already exist.... :D
                   if net_ema is None or epoch_step < num_cooldown_before_freeze_steps: # don't snapshot the network yet if so!
                       net_ema = NetworkEMA(net, decay=projected_ema_decay_val)
@@ -607,7 +691,7 @@ def main():
           
           with torch.no_grad():
               for inputs, targets in get_batches(data, key='eval', batchsize=eval_batchsize):
-                  if epoch >= ema_epoch_start:
+                  if hyp['ablation']['use_ema'] and epoch >= ema_epoch_start:
                       outputs = net_ema(inputs)
                       acc_list_ema.append((outputs.argmax(-1) == targets).float().mean())
                   outputs = net(inputs)
@@ -617,7 +701,7 @@ def main():
               val_acc = torch.stack(acc_list).mean().item()
               ema_val_acc = None
               # TODO: We can fuse these two operations (just above and below) all-together like :D :))))
-              if epoch >= ema_epoch_start:
+              if hyp['ablation']['use_ema'] and epoch >= ema_epoch_start:
                   ema_val_acc = torch.stack(acc_list_ema).mean().item()
 
               val_loss = torch.stack(loss_list_val).mean().item()
@@ -636,6 +720,8 @@ def main():
 
 if __name__ == "__main__":
     acc_list = []
-    for run_num in range(25):
+    for run_num in range(args.runs):
         acc_list.append(torch.tensor(main()))
     print("Mean and variance:", (torch.mean(torch.stack(acc_list)).item(), torch.var(torch.stack(acc_list)).item()))
+    
+	
