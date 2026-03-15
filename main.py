@@ -709,7 +709,12 @@ def main():
           # Print out our training details (sorry for the complexity, the whole logging business here is a bit of a hot mess once the columns need to be aligned and such....)
           ## We also check to see if we're in our final epoch so we can print the 'bottom' of the table for each round.
           print_training_details(list(map(partial(format_for_table, locals=locals()), logging_columns_list)), is_final_entry=(epoch == hyp['misc']['train_epochs'] - 1))
-    return ema_val_acc # Return the final ema accuracy achieved (not using the 'best accuracy' selection strategy, which I think is okay here....)
+    # Return the final ema accuracy achieved (not using the 'best accuracy' selection strategy, which I think is okay here....)
+    # TODO [MLA]: On a dû ajouter ce if pour que le code puisse retourner une valeur d'exactitude 
+    # même si les couches EMA ne sont pas utilisées, afin de pouvoir comparer les résultats globaux 
+    # des différentes ablations entre elles (et pas seulement les ablations qui utilisent les couches EMA)
+    # -- c'est un peu moche, mais ça fait le travail pour l'instant.
+    return ema_val_acc if ema_val_acc is not None else val_acc 
 
 if __name__ == "__main__":
     acc_list = []
