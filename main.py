@@ -248,6 +248,8 @@ class ConvGroup(nn.Module):
             self.norm2 = BatchNorm(channels_out)
             self.norm3 = BatchNorm(channels_out)
 
+            # TODO [MLA]: On a ajouté ce if pour que les couches SE ne soient pas construites si on ne les utilise pas
+            # Ainsi, on économise de la mémoire GPU et du temps de calcul pour montrer l'impact global des couches SE
             # SE layers are only built when the ablation flag is set
             if self.se:
                 self.se1 = nn.Linear(channels_out, channels_out//16)
