@@ -546,7 +546,7 @@ def init_split_parameter_dictionaries(network):
 ## Hey look, it's the soft-targets/label-smoothed loss! Native to PyTorch. Now, _that_ is pretty cool, and simplifies things a lot, to boot! :D :)
 loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['ablation']['label_smoothing'], reduction='none')
 
-logging_columns_list = ['epoch', 'train_loss', 'val_loss', 'train_acc', 'val_acc', 'ema_val_acc', 'total_time_seconds']
+logging_columns_list = ['epoch', 'train_loss', 'val_loss', 'train_acc', 'val_acc', 'ema_val_acc', 'train_time_s', 'eval_time_s', 'total_time_s']
 # define the printing function and print the column heads
 def print_training_details(columns_list, separator_left='|  ', separator_right='  ', final="|", column_heads_only=False, is_final_entry=False):
     print_string = ""
@@ -577,6 +577,8 @@ def main():
                    ## (as opposed to initializing the network_ema from the randomly-initialized starter network, then forcing it to play catch-up all of a sudden in the last several epochs)
 
     total_time_seconds = 0.
+    train_time_seconds = 0.
+    eval_time_seconds = 0.
     current_steps = 0.
     
     # TODO: Doesn't currently account for partial epochs really (since we're not doing "real" epochs across the whole batchsize)....
@@ -615,7 +617,8 @@ def main():
     lr_sched_bias = torch.optim.lr_scheduler.OneCycleLR(opt_bias, max_lr=bias_params['lr'], pct_start=pct_start, div_factor=initial_div_factor, final_div_factor=1./(initial_div_factor*final_lr_ratio), total_steps=total_train_steps-num_low_lr_steps_for_ema, anneal_strategy='linear', cycle_momentum=False)
 
     ## For accurately timing GPU code
-    starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    train_starter, train_ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    eval_starter, eval_ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     ## There's another repository that's mainly reorganized David's code while still maintaining some of the functional structure, and it
     ## has a timing feature too, but there's no synchronizes so I suspect the times reported are much faster than they may be in actuality
     ## due to some of the quirks of timing GPU operations.
@@ -628,7 +631,7 @@ def main():
           # Training Mode #
           #################
           torch.cuda.synchronize()
-          starter.record()
+          train_starter.record()
           net.train()
 
           loss_train = None
@@ -670,13 +673,16 @@ def main():
                       net_ema = NetworkEMA(net, decay=projected_ema_decay_val)
                       continue
                   net_ema.update(net)
-          ender.record()
+          train_ender.record()
           torch.cuda.synchronize()
-          total_time_seconds += 1e-3 * starter.elapsed_time(ender)
+          epoch_train_time = 1e-3 * train_starter.elapsed_time(train_ender)
+          train_time_seconds += epoch_train_time
 
           ####################
           # Evaluation  Mode #
           ####################
+          torch.cuda.synchronize()
+          eval_starter.record()
           net.eval()
 
           eval_batchsize = 1000
@@ -699,6 +705,14 @@ def main():
                   ema_val_acc = torch.stack(acc_list_ema).mean().item()
 
               val_loss = torch.stack(loss_list_val).mean().item()
+          eval_ender.record()
+          torch.cuda.synchronize()
+          epoch_eval_time = 1e-3 * eval_starter.elapsed_time(eval_ender)
+          eval_time_seconds += epoch_eval_time
+          total_time_seconds = train_time_seconds + eval_time_seconds
+          train_time_s = train_time_seconds
+          eval_time_s = eval_time_seconds
+          total_time_s = total_time_seconds
           # We basically need to look up local variables by name so we can have the names, so we can pad to the proper column width.
           ## Printing stuff in the terminal can get tricky and this used to use an outside library, but some of the required stuff seemed even
           ## more heinous than this, unfortunately. So we switched to the "more simple" version of this!
